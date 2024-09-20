@@ -1,7 +1,6 @@
 import os
-from bson import ObjectId
-from services.s3_services import upload_files_to_s3
-from werkzeug.utils import secure_filename
+from bson.objectid import ObjectId
+from datetime import datetime,timezone
 from config import mongo
 
 # def save_file(file):
@@ -23,11 +22,18 @@ def serialize_files(file):
 
 
 def get_files_collection():
+    
     return mongo.db.files
 
-def create_file_entry(filename,url):
+def create_file_entry(filename,urls):
     files_collection = get_files_collection()
-    result = files_collection.insert_one({'filename' : filename, 'url':url})
+    file_entry = {
+        'filename': filename,
+        'urls': urls,  # List of URLs with region info
+        'upload_time': datetime.now(timezone.utc),
+        'size': sum(file.getbuffer().nbytes for url in urls),  # Optionally store the file size
+    }
+    result = files_collection.insert_one(file_entry)
     return str(result.inserted_id)
 
 def get_file_entry(file_id):
