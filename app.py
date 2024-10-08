@@ -1,7 +1,7 @@
-from flask import Flask
-from flask_jwt_extended import JWTManager
+from flask import Flask,jsonify
 from config import Config,mongo
 from routes.file_routes import file_bp
+from services.s3_services import start_health_monitoring,bucket_health
 
 def create_app():
     app = Flask(__name__)
@@ -19,4 +19,8 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
+    start_health_monitoring()
     app.run(debug=True)
+    @app.route('/health')
+    def get_health_status():
+        return jsonify(bucket_health)

@@ -1,8 +1,11 @@
 import boto3
 from config import Config
-from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
 import io
-import requests
+import time
+import concurrent.futures
+from threading import Thread
+from models.file import compress_chunk,decompress_chunk
+
 
 s3_clients ={
     'us-east-1' : boto3.client('s3', region_name='us-east-1',
@@ -17,43 +20,8 @@ s3_clients ={
 
 } 
 
-def upload_files_to_s3(file,filename):
-    urls=[]
-    try:
+bucket_health = {region: True for region in Config.S3_BUCKET_NAME}
 
-        file_data = file.read()
-
-        for region, bucket_name in zip(s3_clients.keys(), Config.S3_BUCKET_NAME.values()):
-            # Use pre-initialized S3 client for the specific region
-            s3_client = s3_clients[region]
-            
-            file_copy = io.BytesIO(file_data)
-
-            # Upload file to the respective bucket
-            s3_client.upload_fileobj(file_copy, bucket_name, filename)
-
-            # Generate the file URL for the region and bucket
-            url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{filename}"
-            urls.append({'url': url, 'region': region})
-
-        return urls
-    except FileNotFoundError:
-        print(f"Error: The file was not found: {filename}")
-        return None
-    except NoCredentialsError:
-        print("Error: AWS credentials not found.")
-        return None
-    except PartialCredentialsError:
-        print("Error: Incomplete AWS credentials.")
-        return None
-    except ClientError as e:
-        # Catch all client errors and log the response
-        print(f"Error uploading file to S3: {e.response['Error']['Message']}")
-        return None
-    except Exception as e:
-        # Catch any other exceptions
-        print(f"An unexpected error occurred: {e}")
-        return None
     
 def delete_file_from_s3(filename,urls):
     try:
@@ -61,65 +29,78 @@ def delete_file_from_s3(filename,urls):
             region = url_info['region']
             client = s3_clients[region]
             bucket_name = Config.S3_BUCKET_NAME[region]
-            client.delete_object(Bucket = bucket_name, Key = filename)
+            
+            chunk_filename = url_info['url'].split('/')[-1]
+            
+            client.delete_object(Bucket = bucket_name, Key = chunk_filename)
+            
+            print(f"Deleted {chunk_filename} from {bucket_name} in region {region}.")
         return True
     except Exception as e:
         print(f"Error deleting file from S3: {e}")
         return False
     
 def upload_chunks_to_s3(file, filename):
-    file.seek(0)  # Ensure the file pointer is at the start
+    file.seek(0)  
     urls = []
-
-    # Read the file in chunks and upload
     chunk_number = 1
-    while True:
-        chunk = file.read(Config.CHUNK_SIZE)
-        if not chunk:
-            break  # End of file
 
-        for region, s3_client in s3_clients.items():
-            try:
-                chunk_file = io.BytesIO(chunk)  # Create an in-memory file for this chunk
-                chunk_filename = f"{filename}_chunk_{chunk_number}"
-                bucket_name = Config.S3_BUCKET_NAME[region]
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = []
 
-                # Upload the chunk to the specific S3 bucket
-                s3_client.upload_fileobj(chunk_file, bucket_name, chunk_filename)
+        while True:
+            chunk = file.read(Config.CHUNK_SIZE)
+            if not chunk:
+                break 
 
-                # Generate the URL for this chunk in the current region
-                url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{chunk_filename}"
-                urls.append({'url': url, 'region': region, 'chunk_number': chunk_number})
+            for region, s3_client in s3_clients.items():
+                futures.append(executor.submit(upload_chunk,chunk,filename,chunk_number,region))
+            
+            chunk_number += 1  
 
-            except Exception as e:
-                print(f"Error uploading chunk {chunk_number} to S3 in region {region}: {str(e)}")
-                return None
-
-            chunk_number += 1  # Move to the next chunk
-
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result:
+                urls.append(result)
+    
     return urls
+
+def upload_chunk(chunk,filename,chunk_number,region):
+    try:
+        compressed_chunk = compress_chunk(chunk)
+        
+        s3_client = s3_clients[region]
+        chunk_file = io.BytesIO(compressed_chunk)  
+        chunk_filename = f"{filename}_chunk_{chunk_number}.gz"
+        bucket_name = Config.S3_BUCKET_NAME[region]
+        
+        s3_client.upload_fileobj(chunk_file, bucket_name, chunk_filename)
+        
+        url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{chunk_filename}"
+        return {'url': url, 'region': region, 'chunk_number': chunk_number}
+    except Exception as e:
+        print(f"Error uploading chunk {chunk_number} to S3 in region {region}: {str(e)}")
+        return None
 
 def download_chunks_from_s3(chunk_urls):
     chunks = []
-    errors = []  # List to keep track of failed URLs
+    errors = [] 
 
-    for chunk_info in chunk_urls:
-        try:
-            region = chunk_info['region']
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures=[]
+
+        for chunk_info in chunk_urls:
             url = chunk_info['url']
-            bucket = url.split('.')[0].split('//')[1] 
-            key = url.split('/')[-1]
+            backup_url = chunk_info.get('backup_url', None)
 
-            s3_client = boto3.client('s3', region_name=region)
-            
-            response = s3_client.get_object(Bucket=bucket, Key=key)
-            chunk_data = response['Body'].read()
+            futures.append(executor.submit(download_chunk_with_failover, url, backup_url, chunk_info['region']))
 
-            chunks.append(chunk_data)
-        except Exception as e:
-            error_message = f"Error downloading chunk from {chunk_info['url']}: {e}"
-            print(error_message)
-            errors.append(error_message)
+        for future in concurrent.futures.as_completed(futures):
+            result=future.result()
+            if result:
+                chunks.append(result)
+            else:
+                errors.append("Failed to download chunks")
 
     if errors:
         print("Errors encountered during download:")
@@ -127,3 +108,56 @@ def download_chunks_from_s3(chunk_urls):
             print(error)
     
     return chunks if chunks else None
+
+def check_bucket_health():
+    while True:
+        for region, bucket_name in Config.S3_BUCKET_NAME.items():
+            try:
+                s3_clients[region].head_bucket(Bucket = bucket_name)
+                bucket_health[region] = True
+                print(f"Bucket {bucket_name} in {region} is healthy.")
+            except Exception as e:
+                bucket_health[region] = False
+                print(f"Bucket {bucket_name} in {region} is DOWN: {e}")
+        time.sleep(60)
+
+def start_health_monitoring():
+    thread = Thread(target=check_bucket_health)
+    thread.daemon = True
+    thread.start()
+
+def download_chunk_with_failover(primary_url,backup_url,region):
+    try:
+        chunk_data = donwload_chunk_from_s3(primary_url, region)
+        
+        if chunk_data:
+            print(f"Downloaded chunk from primary URL: {primary_url}")
+            return chunk_data
+    except Exception as e:
+        print(f"Primary download failed : {e}")
+
+    if backup_url:
+        try:
+            chunk_data = donwload_chunk_from_s3(backup_url, region)
+            if chunk_data:
+                print(f"Downloaded chunk from backup URL: {backup_url}")
+                return chunk_data
+        except Exception as e:
+            print(f"Backup download failed for {backup_url}: {e}")
+    
+    return None
+
+def donwload_chunk_from_s3(url,region):
+    try:
+        bucket = url.split('.')[0].split('//')[1] 
+        key = url.split('/')[-1]
+
+        s3_client = boto3.client('s3', region_name=region)
+            
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        compressed_chunk_data = response['Body'].read()
+        
+        chunk_data = decompress_chunk(compressed_chunk_data)
+        return chunk_data
+    except Exception as e:
+        raise e

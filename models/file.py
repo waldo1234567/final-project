@@ -3,7 +3,7 @@ from datetime import datetime,timezone
 from config import mongo,Config
 import os
 import io
-
+import gzip
 
 def serialize_files(file):
     return{
@@ -88,3 +88,15 @@ def reconstruct_file(chunks):
 
     reconstructed_file.seek(0)
     return reconstructed_file
+
+def compress_chunk(chunk):
+    compressed_chunk = io.BytesIO()
+    with gzip.GzipFile(fileobj=compressed_chunk, mode='wb') as gz:
+        gz.write(chunk)
+    return compressed_chunk.getvalue()
+
+def decompress_chunk(compressed_data):
+    decompressed_chunk = io.BytesIO()
+    with gzip.GzipFile(fileobj=io.BytesIO(compressed_data), mode='rb') as gz:
+        decompressed_chunk.write(gz.read())
+    return decompressed_chunk.getvalue()

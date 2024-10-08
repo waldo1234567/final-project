@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from services import s3_services
-from models.file import create_file_entry, get_file_entry, get_all_files, delete_file_entry,get_file_entry_for_deletion,split_file_into_chunks,reconstruct_file
+from models.file import create_file_entry, get_file_entry, get_all_files, delete_file_entry,get_file_entry_for_deletion,reconstruct_file
 import os
 from werkzeug.utils import secure_filename
 from flask import send_file
