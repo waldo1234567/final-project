@@ -4,6 +4,7 @@ from config import mongo,Config
 import os
 import io
 import gzip
+import hashlib
 
 def serialize_files(file):
     return{
@@ -100,3 +101,13 @@ def decompress_chunk(compressed_data):
     with gzip.GzipFile(fileobj=io.BytesIO(compressed_data), mode='rb') as gz:
         decompressed_chunk.write(gz.read())
     return decompressed_chunk.getvalue()
+
+def generate_md5(chunk):
+    md5_hash = hashlib.md5()
+    md5_hash.update(chunk)
+    return md5_hash.hexdigest()
+
+def verify_md5(chunk,original_md5):
+    md5_hash = hashlib.md5()
+    md5_hash.update(chunk)
+    return md5_hash.hexdigest() == original_md5
