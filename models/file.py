@@ -1,14 +1,23 @@
-import json
 import time
 from bson.objectid import ObjectId
 from datetime import datetime,timezone
-from config import mongo,Config, redis_client , CACHE_TTL
+from config import KMS_CLIENT, KMS_KEY_ID,mongo,Config
+from datetime import datetime, timezone
 import os
 import io
 import gzip
 import hashlib
 import zfec
 from utils.metrics import RECONSTRUCT_LATENCY
+from pymongo import MongoClient
+
+_client = None
+
+def get_mongo_client():
+    global _client
+    if _client is None:
+        _client = MongoClient(Config.MONGO_URI)
+    return _client
 
 def serialize_files(file):
     return{
@@ -34,23 +43,64 @@ def calculate_k_and_m(file_size , base_k = 6, base_m = 3):
 
     
 def get_files_collection():
-    
-    return mongo.db.files
+    client = get_mongo_client()
+    db = client["dfs_project"]
+    return db["files"]
 
 def create_file_entry(filename,chunk_urls,file):
+    resp = KMS_CLIENT.generate_data_key(KeyId=KMS_KEY_ID, KeySpec="AES_256")
+    plaintext_key = resp["Plaintext"]           # bytes, 32-byte key
+    encrypted_data_key = resp["CiphertextBlob"]  # bytes, encrypted key
+    
+    
     files_collection = get_files_collection()
 
     file_size = file.seek(0, os.SEEK_END)
     file.seek(0)
-
+    
     file_entry = {
         'filename': filename,
         'urls': chunk_urls, 
         'upload_time': datetime.now(timezone.utc),
-        'size': file_size  
+        'size': file_size,
+        "encrypted_data_key": encrypted_data_key,
     }
     result = files_collection.insert_one(file_entry)
-    return str(result.inserted_id)
+    return str(result.inserted_id), plaintext_key
+
+
+def create_file_entry_preupload(filename: str, file_size: int):
+    # Generate data key from KMS
+    resp = KMS_CLIENT.generate_data_key(KeyId=KMS_KEY_ID, KeySpec="AES_256")
+    plaintext_key = resp["Plaintext"]           # bytes, in-memory only
+    encrypted_data_key = resp["CiphertextBlob"] # bytes to store
+
+    files_collection = get_files_collection()
+
+    file_entry = {
+        'filename': filename,
+        'urls': [], 
+        'upload_time': datetime.now(timezone.utc),
+        'size': file_size,
+        'encrypted_data_key': encrypted_data_key,
+        'status': 'uploading'
+    }
+    result = files_collection.insert_one(file_entry)
+    return str(result.inserted_id), plaintext_key
+
+def update_file_urls_and_mark_available(file_id: str, chunk_urls: list):
+    files_collection = get_files_collection()
+    return files_collection.update_one(
+        {'_id': ObjectId(file_id)},
+        {'$set': {'urls': chunk_urls, 'status': 'available', 'upload_time': datetime.now(timezone.utc)}}
+    )
+
+def mark_file_as_failed(file_id: str, reason: str = None):
+    files_collection = get_files_collection()
+    update = {'$set': {'status': 'failed'}}
+    if reason:
+        update['$set']['failure_reason'] = reason
+    files_collection.update_one({'_id': ObjectId(file_id)}, update)
 
 def get_file_entry(file_id,user_region):
     files_collection = get_files_collection()
@@ -91,18 +141,23 @@ def split_file_into_chunks(file):
     file.seek(0)
     file_data = file.read()
 
-    k,m = calculate_k_and_m(len(file_data))
-    
+    k, m = calculate_k_and_m(len(file_data))
+
     chunk_size = len(file_data) // k
     padding_size = (k - (len(file_data) % k)) % k
     file_data += b'\x00' * padding_size
-    
+
+    # Make raw k chunks (bytes)
     chunks = [file_data[i * chunk_size:(i + 1) * chunk_size] for i in range(k)]
-    
-    enc = zfec.Encoder(k, k+ m)
+
+    enc = zfec.Encoder(k, k + m)
     encoded_chunks = enc.encode(chunks)
-    return encoded_chunks
-    
+
+    # Convert each shard (list of ints) into bytes
+    encoded_chunks_bytes = [bytes(c) for c in encoded_chunks]
+
+    return encoded_chunks_bytes, k, m, padding_size
+
 def reconstruct_file(chunks):
     try:
         

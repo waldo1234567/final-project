@@ -1,4 +1,5 @@
 import os
+import boto3
 from flask_pymongo import PyMongo
 from pymongo import MongoClient
 from services.encryption import decrypt_jwt_secret
@@ -19,9 +20,11 @@ class Config:
     MONGO_URI = os.getenv('MONGO_URI')
 
     CHUNK_SIZE = 5 * 1024 * 1024
-
+    
 mongo = PyMongo()
 
+KMS_KEY_ID = os.getenv('KMS_KEY_ID')
+KMS_CLIENT = boto3.client("kms", region_name='us-east-1')
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 redis_client = Redis.from_url(REDIS_URL, decode_responses = True)

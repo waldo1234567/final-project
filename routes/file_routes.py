@@ -14,6 +14,11 @@ from services.cache_services import (
     increment_cache_miss,
 )
 from services.region_selector import detect_user_region
+from config import KMS_CLIENT
+from services.crypto_service import decrypt_chunk
+import gzip
+import os
+from models.file import create_file_entry_preupload, mark_file_as_failed, update_file_urls_and_mark_available
 
 file_bp = Blueprint('file_bp', __name__)
 
@@ -26,13 +31,51 @@ def upload_file():
         return jsonify({'message' : 'No selected file'}),400
     filename = secure_filename(file.filename)
     
-    chunks_url = s3_services.upload_chunks_to_s3(file, filename)
-
-    if not chunks_url:
-        return jsonify({'message': 'failed to upload file!'}),500
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
     
-    file_id = create_file_entry(file.filename, chunks_url,file)
-    return jsonify({'message': 'file uploaded successfully!', 'file_id': file_id}),201
+    file_id, plaintext_key = create_file_entry_preupload(filename, file_size)
+    
+    uploaded_urls = []
+    try:
+        file.seek(0)
+        uploaded_urls = s3_services.upload_chunks_to_s3(file, filename, data_key=plaintext_key, file_id=file_id)
+
+        if not uploaded_urls:
+            # upload failed or returned no urls
+            # clean up partial upload and mark failed
+            s3_services.delete_s3_objects(uploaded_urls)
+            mark_file_as_failed(file_id, reason="no chunks uploaded")
+            return jsonify({'message': 'failed to upload file!'}), 500
+
+        # 3) finalize metadata: store urls and mark available
+        update_file_urls_and_mark_available(file_id, uploaded_urls)
+
+        return jsonify({'message': 'file uploaded successfully!', 'file_id': file_id}), 201
+
+    except Exception as e:
+        # cleanup partial uploads
+        try:
+            s3_services.delete_s3_objects(uploaded_urls)
+        except Exception as cleanup_err:
+            print("Cleanup error:", cleanup_err)
+
+        mark_file_as_failed(file_id, reason=str(e))
+        print("Upload exception:", e)
+        return jsonify({'message': 'failed to upload file!'}), 500
+
+    finally:
+        # best-effort zero-out plaintext key
+        try:
+            plaintext_key = b'\x00' * len(plaintext_key)
+        except Exception:
+            pass
+        finally:
+            try:
+                del plaintext_key
+            except Exception:
+                pass
 
 
 @file_bp.route('/upload-editor-file', methods=['POST'])
@@ -97,6 +140,10 @@ def download_file(file_id):
         user_region = detect_user_region()
 
     file_entry = get_file_entry(file_id, user_region)
+    encrypted_data_key = file_entry["encrypted_data_key"]
+    
+    dk_resp = KMS_CLIENT.decrypt(CiphertextBlob=encrypted_data_key)
+    data_key = dk_resp["Plaintext"]
     if not file_entry:
         return jsonify({'message': 'File not found!'}), 404
     
@@ -123,13 +170,20 @@ def download_file(file_id):
     print('file entry:' ,file_entry)
     print('Type of file_entry:', type(file_entry))
     
-    chunks,content_type = s3_services.download_chunks_from_s3(chunk_urls)
+    chunks, content_type = s3_services.download_chunks_from_s3(chunk_urls)
+    if chunks is None:
+        return jsonify({'message': 'Failed to reconstruct file: not enough valid chunks.'}), 500
+    decrypted_chunks = []
+    for comp in chunks:
+        encrypted = gzip.decompress(comp)
+        pt = decrypt_chunk(encrypted, data_key)
+        decrypted_chunks.append(pt)
     
     if not chunks:
         return jsonify({'message': 'Failed to download file from s3'}), 500
     
     if chunks:
-        reconstructed_file = reconstruct_file(chunks)
+        reconstructed_file = reconstruct_file(decrypted_chunks)
 
         resp = send_file(
             reconstructed_file, 

@@ -5,6 +5,7 @@ from services.s3_services import start_health_monitoring,bucket_health
 from prometheus_client import start_http_server
 from flask_cors import CORS
 import utils.metrics
+from pymongo import MongoClient
 
 
 def start_metrics_server(port = 8000):
@@ -14,8 +15,8 @@ def start_metrics_server(port = 8000):
     
 def create_app():
     app = Flask(__name__)
-    app.config.from_object(Config)
     CORS(app,origins="http://localhost:5173",expose_headers=["Content-Disposition"])
+    app.config["MONGO_URI"] = Config.MONGO_URI
     mongo.init_app(app)
     print(mongo.db.list_collection_names())
     from routes import auth

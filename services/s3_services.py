@@ -7,6 +7,8 @@ import mimetypes
 from threading import Thread
 from models.file import compress_chunk,decompress_chunk,verify_md5,generate_md5,split_file_into_chunks,reconstruct_missing_chunks
 from utils.metrics import UPLOAD_LATENCY, UPLOAD_THROUGHPUT, ERROR_COUNT,DOWNLOAD_LATENCY,RECONSTRUCT_LATENCY
+from services.crypto_service import encrypt_chunk
+from werkzeug.utils import secure_filename
 
 s3_clients ={
     'us-east-1' : boto3.client('s3', region_name='us-east-1',
@@ -40,17 +42,17 @@ def delete_file_from_s3(filename,urls):
         print(f"Error deleting file from S3: {e}")
         return False
     
-def upload_chunks_to_s3(file, filename):
+def upload_chunks_to_s3(file, filename, data_key, file_id):
     file.seek(0)  
     urls = []
-    chunks = split_file_into_chunks(file)
+    encoded_chunks, k, m, padding = split_file_into_chunks(file)
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = []
 
-        for chunk_number , chunk in enumerate(chunks):
+        for chunk_number , chunk in enumerate(encoded_chunks):
             region = list(s3_clients.keys())[chunk_number % len(s3_clients)]
-            futures.append(executor.submit(upload_chunk , chunk , filename , chunk_number, region))
+            futures.append(executor.submit(upload_chunk , chunk , filename , chunk_number, region, data_key, file_id))
 
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
@@ -59,17 +61,19 @@ def upload_chunks_to_s3(file, filename):
         
     return urls
 
-def upload_chunk(chunk,filename,chunk_number,region, content_type = None):
+def upload_chunk(chunk,filename,chunk_number,region,data_key, file_id, content_type = None):
     start = time.time()
     try:
-        compressed_chunk = compress_chunk(chunk)
+        encrypted = encrypt_chunk(chunk, data_key)
+        compressed_chunk = compress_chunk(encrypted)
         
         s3_client = s3_clients[region]
         chunk_file = io.BytesIO(compressed_chunk)  
-        chunk_filename = f"{filename}_chunk_{chunk_number}.gz"
+        
+        chunk_filename = f"uploads/{file_id}/{secure_filename(filename)}_chunk_{chunk_number}.gz"
         bucket_name = Config.S3_BUCKET_NAME[region]
         
-        md5_checksum = generate_md5(chunk)
+        md5_checksum = generate_md5(compressed_chunk)
         
         if not content_type:
             guessed, _ = mimetypes.guess_type(filename)
@@ -85,6 +89,7 @@ def upload_chunk(chunk,filename,chunk_number,region, content_type = None):
                     'md5_checksum' : md5_checksum
                 }
             }
+            
         )
         
         duration = time.time() - start
@@ -106,28 +111,40 @@ def download_chunks_from_s3(chunk_urls):
     k = max(1 , total_chunks - 3)
     m = total_chunks - k
     
-    chunks = [None] *  total_chunks
+    chunks = [None] * total_chunks            # compressed bytes
+    indices = [None] * total_chunks  
     errors = [] 
     content_type = None
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures={}
-
-        for i ,chunk_info in enumerate(chunk_urls):
+        futures = {}
+        for i, chunk_info in enumerate(chunk_urls):
             url = chunk_info['url']
             backup_url = chunk_info.get('backup_url', None)
             expected_md5 = chunk_info['md5_checksum']
-
-            future = executor.submit(download_chunk_with_failover, url, backup_url, chunk_info['region'],expected_md5)
+            region = chunk_info['region']
+            # Extract S3 key from URL
+            try:
+                key = url.split(f".amazonaws.com/")[1]
+            except Exception:
+                key = url
+            bucket_name = Config.S3_BUCKET_NAME[region]
+            s3_client = s3_clients[region]
+            # Check if chunk exists in S3
+            try:
+                s3_client.head_object(Bucket=bucket_name, Key=key)
+                print(f"Chunk exists: Bucket={bucket_name}, Key={key}")
+            except Exception as e:
+                print(f"Chunk missing: Bucket={bucket_name}, Key={key}, Error={e}")
+            future = executor.submit(download_chunk_with_failover, url, backup_url, region, expected_md5)
             futures[future] = i
-            
         for future in concurrent.futures.as_completed(futures):
             index = futures[future]
-            result=future.result()
+            result = future.result()
             if result:
                 if 'content_type' in result and not content_type:
                     content_type = result['content_type']
-                chunks[index] = result['data']   
+                chunks[index] = result['data']
             else:
                 errors.append("Failed to download chunks")
                 
@@ -156,8 +173,7 @@ def download_chunks_from_s3(chunk_urls):
         for error in errors:
             print(error)
     
-    file_data = b"".join(chunks[:k])
-    return io.BytesIO(file_data), content_type
+    return chunks, content_type
     
 
 def check_bucket_health():
@@ -214,21 +230,19 @@ def download_chunk_with_failover(primary_url,backup_url,region,expected_md5):
 
 def donwload_chunk_from_s3(url,region):
     try:
-        bucket = url.split('.')[0].split('//')[1] 
-        key = url.split('/')[-1]
+        bucket = url.split(".amazonaws.com/")[0].split("//")[1].split(".")[0]
+        key = url.split(".amazonaws.com/")[1] 
 
         s3_client = boto3.client('s3', region_name=region)
             
         response = s3_client.get_object(Bucket=bucket, Key=key)
         
-        compressed_chunk_data = response['Body'].read()
-        if not isinstance(compressed_chunk_data, bytes):
+        blob_data = response['Body'].read()
+        if not isinstance(blob_data, bytes):
             raise ValueError("Downloaded chunk data is not in bytes format")
         
-        chunk_data = decompress_chunk(compressed_chunk_data) if key.endswith('.gz') else compressed_chunk_data
         content_type = response.get('ContentType', 'application/octet-stream')           
-        
-        return {'data': chunk_data, 'content_type' : content_type}
+        return {'data': blob_data, 'content_type': content_type}  # <-- raw compressed blob
     except Exception as e:
         raise e
     
@@ -238,3 +252,41 @@ def upload_editor_generated_file(pdf_buffer, filename):
     except Exception as e:
         print(f"Error uploading editor-generated file: {str(e)}")
         return None
+    
+def delete_s3_objects(urls):
+    items = []
+    for u in urls:
+        if isinstance(u, dict):
+            items.append({'url': u['url'], 'region': u.get('region')})
+        else:
+            # parse region from URL if not supplied (best-effort)
+            items.append({'url': u, 'region': None})
+
+    # group by region
+    by_region = {}
+    for item in items:
+        url = item['url']
+        region = item['region']
+        # parse bucket and key: https://{bucket}.s3.{region}.amazonaws.com/{key}
+        try:
+            parts = url.split('/')
+            key = '/'.join(parts[3:])  # everything after domain
+            domain = parts[2]  # {bucket}.s3.{region}.amazonaws.com
+            bucket = domain.split('.')[0]
+            if not region:
+                # try to parse region from domain: bucket.s3.<region>.amazonaws.com
+                domain_parts = domain.split('.')
+                if len(domain_parts) >= 4:
+                    region = domain_parts[2]
+            by_region.setdefault(region, []).append({'bucket': bucket, 'key': key})
+        except Exception as e:
+            print("Failed to parse S3 url for deletion:", url, e)
+            continue
+
+    for region, objs in by_region.items():
+        s3_client = s3_clients.get(region) or boto3.client('s3', region_name=region)
+        for obj in objs:
+            try:
+                s3_client.delete_object(Bucket=obj['bucket'], Key=obj['key'])
+            except Exception as e:
+                print(f"Failed to delete object {obj['key']} from {obj['bucket']} in {region}: {e}")
