@@ -49,7 +49,7 @@ def orchestrate_fetch(file_id, chunk_no, save_dir ="downloaded_chunks"):
         print("already local, local_path:", local_path)
         return local_path
     
-    peers = discover_mdns(2.0)
+    peers = discover_mdns(2)
     if not peers:
         #fallback
         peers = discover_via_manifest(file_id,manifest_server= MANIFEST_SERVER)
